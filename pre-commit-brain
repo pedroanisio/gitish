@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+pre-commit-brain - Pre-commit hook enforcing Brain protocol
+
+Blocks commits if:
+1. No identity exists (.brain/self.json)
+2. No read receipts exist (never acknowledged current state)
+3. Read receipt is too old (optional, configurable)
+
+Exit codes:
+  0 - OK to commit
+  1 - Blocked (missing identity or read receipt)
+
+Usage:
+  Add to .git/hooks/pre-commit or use with simple-git-hooks
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Maximum age of read receipt before requiring a new one (in hours)
+# Set to 0 to disable age check (only require at least one receipt)
+MAX_RECEIPT_AGE_HOURS = 24
+
+# Files/paths to skip hook for (e.g., documentation-only commits)
+SKIP_PATHS = [
+    "docs/",
+    "README.md",
+    ".gitignore",
+    "*.md",
+]
+
+# Environment variable to bypass hook (for emergencies)
+BYPASS_ENV_VAR = "BRAIN_BYPASS_HOOK"
+
+# =============================================================================
+# Colors for terminal output
+# =============================================================================
+
+class Colors:
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    YELLOW = "\033[1;33m"
+    BLUE = "\033[0;34m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+def error(msg: str):
+    print(f"{Colors.RED}❌ {msg}{Colors.RESET}", file=sys.stderr)
+
+def warn(msg: str):
+    print(f"{Colors.YELLOW}⚠️  {msg}{Colors.RESET}", file=sys.stderr)
+
+def info(msg: str):
+    print(f"{Colors.BLUE}ℹ️  {msg}{Colors.RESET}", file=sys.stderr)
+
+def success(msg: str):
+    print(f"{Colors.GREEN}✅ {msg}{Colors.RESET}", file=sys.stderr)
+
+
+# =============================================================================
+# Checks
+# =============================================================================
+
+def check_bypass() -> bool:
+    """Check if hook bypass is enabled."""
+    if os.environ.get(BYPASS_ENV_VAR):
+        warn(f"Brain hook bypassed via {BYPASS_ENV_VAR}")
+        return True
+    return False
+
+
+def check_identity() -> tuple[bool, dict | None]:
+    """
+    Check if identity exists.
+    Returns (exists, identity_data).
+    """
+    identity_file = Path(".brain/self.json")
+    
+    if not identity_file.exists():
+        return False, None
+    
+    try:
+        with open(identity_file) as f:
+            identity = json.load(f)
+        
+        # Validate required fields
+        if not identity.get("short_name"):
+            return False, None
+        
+        return True, identity
+    
+    except (json.JSONDecodeError, IOError):
+        return False, None
+
+
+def get_latest_receipt(identity: dict) -> tuple[Path | None, dict | None]:
+    """
+    Get the latest read receipt for this identity.
+    Returns (filepath, receipt_data) or (None, None).
+    """
+    receipts_dir = Path(".brain/receipts") / identity["short_name"]
+    
+    if not receipts_dir.exists():
+        return None, None
+    
+    # Find all receipt files
+    receipt_files = sorted(receipts_dir.glob("*.json"), reverse=True)
+    
+    if not receipt_files:
+        return None, None
+    
+    # Get the latest one
+    latest_file = receipt_files[0]
+    
+    try:
+        with open(latest_file) as f:
+            receipt = json.load(f)
+        return latest_file, receipt
+    except (json.JSONDecodeError, IOError):
+        return None, None
+
+
+def check_receipt_age(receipt: dict) -> tuple[bool, timedelta | None]:
+    """
+    Check if receipt is within acceptable age.
+    Returns (is_valid, age).
+    """
+    if MAX_RECEIPT_AGE_HOURS <= 0:
+        # Age check disabled
+        return True, None
+    
+    ts_str = receipt.get("ts")
+    if not ts_str:
+        return False, None
+    
+    try:
+        # Parse ISO timestamp
+        receipt_time = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        age = now - receipt_time
+        
+        max_age = timedelta(hours=MAX_RECEIPT_AGE_HOURS)
+        return age <= max_age, age
+    
+    except (ValueError, TypeError):
+        return False, None
+
+
+def get_staged_files() -> list[str]:
+    """Get list of staged files."""
+    import subprocess
+    
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        return []
+    
+    return [f.strip() for f in result.stdout.split("\n") if f.strip()]
+
+
+def should_skip_for_files(files: list[str]) -> bool:
+    """Check if all staged files are in skip paths."""
+    import fnmatch
+    
+    if not files:
+        return False
+    
+    for f in files:
+        # Check if this file matches any skip pattern
+        matches_skip = False
+        for pattern in SKIP_PATHS:
+            if fnmatch.fnmatch(f, pattern) or f.startswith(pattern.rstrip("/")):
+                matches_skip = True
+                break
+        
+        # If any file doesn't match skip patterns, don't skip
+        if not matches_skip:
+            return False
+    
+    return True
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> int:
+    """
+    Main pre-commit check.
+    Returns exit code (0 = OK, 1 = blocked).
+    """
+    print()
+    print(f"{Colors.BOLD}🧠 Brain Protocol Pre-Commit Check{Colors.RESET}")
+    print("─" * 40)
+    
+    # Check bypass
+    if check_bypass():
+        return 0
+    
+    # Check if only documentation files
+    staged_files = get_staged_files()
+    if should_skip_for_files(staged_files):
+        info("Only documentation files staged, skipping brain check")
+        return 0
+    
+    # Check 1: Identity exists
+    has_identity, identity = check_identity()
+    
+    if not has_identity:
+        error("No identity found!")
+        print()
+        print("  You must initialize your identity before committing.")
+        print()
+        print(f"  Run: {Colors.BOLD}python scripts/brain.py init --name YOUR_NAME{Colors.RESET}")
+        print()
+        return 1
+    
+    success(f"Identity: @{identity['short_name']}")
+    
+    # Check 2: Read receipt exists
+    receipt_file, receipt = get_latest_receipt(identity)
+    
+    if not receipt:
+        error("No read receipts found!")
+        print()
+        print("  You must acknowledge the current state before committing.")
+        print("  This proves you've read all recent messages.")
+        print()
+        print(f"  Run: {Colors.BOLD}python scripts/brain.py sync{Colors.RESET}")
+        print(f"  Then: {Colors.BOLD}python scripts/brain.py receipt{Colors.RESET}")
+        print()
+        return 1
+    
+    # Check 3: Receipt age (if enabled)
+    if MAX_RECEIPT_AGE_HOURS > 0:
+        is_fresh, age = check_receipt_age(receipt)
+        
+        if not is_fresh:
+            hours = age.total_seconds() / 3600 if age else float('inf')
+            error(f"Read receipt is too old! ({hours:.1f} hours)")
+            print()
+            print(f"  Maximum age: {MAX_RECEIPT_AGE_HOURS} hours")
+            print("  You must sync and post a fresh receipt.")
+            print()
+            print(f"  Run: {Colors.BOLD}python scripts/brain.py sync{Colors.RESET}")
+            print(f"  Then: {Colors.BOLD}python scripts/brain.py receipt{Colors.RESET}")
+            print()
+            return 1
+        
+        hours = age.total_seconds() / 3600 if age else 0
+        success(f"Receipt age: {hours:.1f} hours (max: {MAX_RECEIPT_AGE_HOURS}h)")
+    else:
+        success(f"Receipt exists (age check disabled)")
+    
+    # Check 4: Show receipt details
+    commit_ref = receipt.get("up_to_commit", "unknown")[:8]
+    receipt_ts = receipt.get("ts", "unknown")[:19]
+    info(f"Last read: {commit_ref} at {receipt_ts}")
+    
+    print("─" * 40)
+    success("All checks passed - commit allowed")
+    print()
+    
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(1)
+    except Exception as e:
+        error(f"Hook error: {e}")
+        # Don't block on hook errors - fail open
+        warn("Allowing commit due to hook error")
+        sys.exit(0)
+

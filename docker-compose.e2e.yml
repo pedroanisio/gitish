@@ -1,0 +1,166 @@
+# Docker Compose for Brain Protocol E2E Testing
+# Runs 3 independent agent instances with a shared Git repository
+#
+# Usage:
+#   docker compose -f docker-compose.e2e.yml up --build
+#   docker compose -f docker-compose.e2e.yml run test-runner
+#   docker compose -f docker-compose.e2e.yml exec claude /entrypoint.sh status
+#
+# Architecture:
+#   shared-repo: Bare git repository (simulates remote origin)
+#   claude, gpt, gemini: Independent agent containers
+#   test-runner: Orchestrates e2e test scenarios
+
+services:
+  # ==========================================================================
+  # Shared Git Repository (simulates GitHub/GitLab)
+  # ==========================================================================
+  git-server:
+    image: alpine:latest
+    container_name: brain-git-server
+    volumes:
+      - shared-repo:/repo
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache git
+        if [ ! -d /repo/.git ] && [ ! -f /repo/HEAD ]; then
+          echo '📦 Initializing bare git repository...'
+          git init --bare /repo
+          echo '✅ Bare repo created at /repo'
+        else
+          echo '✅ Repo already exists'
+        fi
+        echo '🔒 Git server ready'
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD", "test", "-d", "/repo/objects"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # ==========================================================================
+  # Agent: Claude (Anthropic)
+  # ==========================================================================
+  claude:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: brain-agent-claude
+    environment:
+      - AGENT_NAME=claude
+      - GIT_REMOTE=/shared-repo
+      - WORKSPACE=/workspace/repo
+    volumes:
+      - shared-repo:/shared-repo:ro
+      - claude-workspace:/workspace/repo
+      - ./src:/workspace/src:ro
+      - ./e2e:/workspace/e2e:ro
+    depends_on:
+      git-server:
+        condition: service_healthy
+    command: idle
+    stdin_open: true
+    tty: true
+
+  # ==========================================================================
+  # Agent: GPT (OpenAI)
+  # ==========================================================================
+  gpt:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: brain-agent-gpt
+    environment:
+      - AGENT_NAME=gpt
+      - GIT_REMOTE=/shared-repo
+      - WORKSPACE=/workspace/repo
+    volumes:
+      - shared-repo:/shared-repo:ro
+      - gpt-workspace:/workspace/repo
+      - ./src:/workspace/src:ro
+      - ./e2e:/workspace/e2e:ro
+    depends_on:
+      git-server:
+        condition: service_healthy
+    command: idle
+    stdin_open: true
+    tty: true
+
+  # ==========================================================================
+  # Agent: Gemini (Google)
+  # ==========================================================================
+  gemini:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: brain-agent-gemini
+    environment:
+      - AGENT_NAME=gemini
+      - GIT_REMOTE=/shared-repo
+      - WORKSPACE=/workspace/repo
+    volumes:
+      - shared-repo:/shared-repo:ro
+      - gemini-workspace:/workspace/repo
+      - ./src:/workspace/src:ro
+      - ./e2e:/workspace/e2e:ro
+    depends_on:
+      git-server:
+        condition: service_healthy
+    command: idle
+    stdin_open: true
+    tty: true
+
+  # ==========================================================================
+  # Test Runner - Orchestrates E2E Scenarios
+  # ==========================================================================
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-runner
+    container_name: brain-test-runner
+    environment:
+      - AGENT_NAME=test-runner
+      - GIT_REMOTE=/shared-repo
+      - WORKSPACE=/workspace/repo
+    volumes:
+      - shared-repo:/shared-repo
+      - runner-workspace:/workspace/repo
+      - ./src:/workspace/src:ro
+      - ./e2e:/workspace/e2e:ro
+      - ./tests:/workspace/tests:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - claude
+      - gpt
+      - gemini
+    command: test /workspace/e2e/scenarios/run_all.sh
+    profiles:
+      - test
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  # Shared bare git repository
+  shared-repo:
+    driver: local
+  
+  # Per-agent workspaces (isolated clones)
+  claude-workspace:
+    driver: local
+  gpt-workspace:
+    driver: local
+  gemini-workspace:
+    driver: local
+  runner-workspace:
+    driver: local
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  default:
+    name: brain-e2e-network
+

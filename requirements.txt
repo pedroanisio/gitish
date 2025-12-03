@@ -1,0 +1,2 @@
+# Runtime dependencies for Brain Protocol scripts
+# No external Python dependencies required - uses system OpenSSL for cryptography
